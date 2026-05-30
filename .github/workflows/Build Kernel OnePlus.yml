@@ -36,7 +36,7 @@ on:
           - oneplus_ace_3v_b
           - oneplus_pad_mt6897_b
           - oneplus_13r_b
-          - oneplus_ace3_pro_b
+          - oneplus_ace3_pro_v
           - oneplus_ace5_b
           - oneplus_pad_pro_b
           - oneplus_pad2_b
@@ -189,6 +189,9 @@ on:
         required: true
         default: false
 
+permissions:
+  contents: write
+  actions: read
 jobs:
   build:
     name: ${{ github.event.inputs.FAST_BUILD == 'true' && ' [FAST]' || '' }}${{ contains(github.event.inputs.FILE, '_aosp') && ' [AOSP]' || '' }}${{ github.event.inputs.KPM == 'KPM' && ' [KPM]' || github.event.inputs.KPM == 'KPN' && ' [KPN]' || '' }}${{ github.event.inputs.LSM_BBG == 'true' && ' [BBG]' || '' }}${{ github.event.inputs.SCHED_HMBIRD == 'true' && ' [HMBIRD]' || '' }}${{ github.event.inputs.DROID_SPACES == 'true' && ' [DS]' || '' }}${{ startsWith(github.event.inputs.ZRAM, '1/') && ' [ZRAM]' || '' }}${{ github.event.inputs.RE_KERNEL == 'true' && ' [REKER]' || '' }}${{ github.event.inputs.LZ4_UPDATE == 'true' && ' [LZ4UPD]' || '' }}For ${{ github.event.inputs.FILE }} ${{ github.event.inputs.SUFFIX }}
@@ -198,6 +201,7 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_NOHARDLINK: "true"
       CCACHE_IS_KERNEL_COMPILING: "true"
+      CCACHE_COMPRESS: "true"
       CCACHE_MAXSIZE: 5G
     steps:
       - name: Checkout
@@ -414,6 +418,33 @@ jobs:
 
           echo "------------------------------"
 
+      - name: Compatibility Check
+        run: |
+          FILE_LOWER=$(echo "${{ github.event.inputs.FILE }}" | tr '[:upper:]' '[:lower:]')
+
+          # Check: MTK device + NETFILTER = error
+          if echo "$FILE_LOWER" | grep -qiE '_mt[0-9]' && [ "${{ github.event.inputs.NETFILTER }}" = "true" ]; then
+            echo "::error::MTK device detected and NETFILTER is enabled. MTK devices do not support NETFILTER extension. Please disable NETFILTER."
+            exit 1
+          fi
+
+          # Check: Ace5 + SCHED_HMBIRD = error
+          if echo "$FILE_LOWER" | grep -q '^oneplus_ace5' && [ "${{ github.event.inputs.SCHED_HMBIRD }}" = "true" ]; then
+            echo "::error::OnePlus Ace5 does not support SCHED_HMBIRD (Fengchi driver). Please disable SCHED_HMBIRD."
+            exit 1
+          fi
+
+          # Validate ZRAM format: {0/1}/{algo}/{bytes}
+          if ! echo "${{ github.event.inputs.ZRAM }}" | grep -qE '^[01]/[a-zA-Z0-9_]+/[0-9]+$'; then
+            echo "::error::ZRAM format invalid. Expected format: {0/1}/{algorithm}/{size_bytes}. Got: ${{ github.event.inputs.ZRAM }}"
+            exit 1
+          fi
+
+          # Warn if SUSFS_CI is not N/A when manager is MIUIX/MD3 (combo already has modules)
+          if echo "${{ github.event.inputs.MANAGER_SOURCE }}" | grep -qiE '^(MIUIX|MD3)' && [ "${{ github.event.inputs.SUSFS_CI }}" != "N/A" ]; then
+            echo "::warning::SUSFS_CI is '${{ github.event.inputs.SUSFS_CI }}' but Manager is '${{ github.event.inputs.MANAGER_SOURCE }}' which already has modules built-in. Consider setting SUSFS_CI to N/A."
+          fi
+
       - name: Check Disk Space
         run: df -h
 
@@ -438,10 +469,11 @@ jobs:
           git config --global user.name "Numbersf"
           git config --global user.email "263623064@qq.com"
           mkdir kernel_workspace && cd kernel_workspace
-          git clone https://github.com/Numbersf/Action-Build.git -b SukiSU-Ultra
+          git clone --depth=1 --single-branch https://github.com/Numbersf/Action-Build.git -b SukiSU-Ultra
 
       - name: Fork Check
         run: |
+          set -euo pipefail
           repo="${{ github.repository }}"; json=$(curl -s "https://api.github.com/repos/$repo")
           parent=$(echo "$json" | grep -o '"full_name": *"[^"]*"' | head -n 2 | tail -n 1 | sed 's/.*"full_name": *"\([^"]*\)".*/\1/')
           if [ -n "$parent" ] && [ "$parent" != "Numbersf/Action-Build" ]; then
@@ -478,6 +510,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
+          set -euo pipefail
           mkdir -p ~/apt-cache-debs
           if [ "${{ steps.apt-cache.outputs.cache-hit }}" != "true" ]; then
             sudo apt-get update
@@ -538,6 +571,7 @@ jobs:
         env:
           FILE: ${{ github.event.inputs.FILE }}
         run: |
+          set -euo pipefail
           cd kernel_workspace
           mkdir -p .repo/manifests
           cp "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" ".repo/manifests/${FILE}.xml"
@@ -827,9 +861,30 @@ jobs:
           FILE: ${{ github.event.inputs.FILE }}
         run: |
           cd kernel_workspace
+          echo "Cloning patches in parallel..."
+          PIDS=""
+          if [ "${{ github.event.inputs.SUSFS_META }}" != "-1" ]; then
+            (git clone --depth=1 --single-branch https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.KANDROID_VERSION }}-${{ env.KERNEL_VERSION }}${{ github.event.inputs.SUSFS_DEV == 'true' && '-dev' || '' }} && echo "susfs4ksu done") &
+            PIDS="$PIDS $!"
+          fi
+          if [ "${{ github.event.inputs.RE_KERNEL }}" = "true" ]; then
+            (git clone --depth=1 --single-branch https://github.com/Sakion-Team/Re-Kernel.git && echo "Re-Kernel done") &
+            PIDS="$PIDS $!"
+          fi
+          if [ "${{ github.event.inputs.LZ4_UPDATE }}" = "true" ]; then
+            (git clone --depth=1 --single-branch https://github.com/Numbersf/lz4_oplus.git && echo "lz4_oplus done") &
+            PIDS="$PIDS $!"
+          fi
+          (git clone --depth=1 --single-branch https://github.com/ShirkNeko/SukiSU_patch.git && echo "SukiSU_patch done") &
+          PIDS="$PIDS $!"
+
+          # Wait for all clones
+          for pid in $PIDS; do wait "$pid" 2>/dev/null || true; done
+          echo "All clones completed"
+
+          # SUSFS checkout logic (after clone completed)
           if [ "${{ github.event.inputs.SUSFS_META }}" != "-1" ]; then
             SUSFS_META="${{ github.event.inputs.SUSFS_META }}"
-            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.KANDROID_VERSION }}-${{ env.KERNEL_VERSION }}${{ github.event.inputs.SUSFS_DEV == 'true' && '-dev' || '' }}
             cd susfs4ksu
             if [ -n "$SUSFS_META" ]; then
               if [[ "$SUSFS_META" =~ ^[0-9]+$ ]]; then
@@ -842,13 +897,6 @@ jobs:
             fi
             cd ..
           fi
-          if [ "${{ github.event.inputs.RE_KERNEL }}" = "true" ]; then
-            git clone https://github.com/Sakion-Team/Re-Kernel.git
-          fi
-          if [ "${{ github.event.inputs.LZ4_UPDATE }}" = "true" ]; then
-            git clone https://github.com/Numbersf/lz4_oplus.git
-          fi
-          git clone https://github.com/ShirkNeko/SukiSU_patch.git
           cd kernel_platform
           if [ "${{ github.event.inputs.SUSFS_META }}" != "-1" ]; then
             echo "正在拉取susfs补丁"
@@ -1142,7 +1190,7 @@ jobs:
               exit 0
             }
           done
-          git clone https://github.com/Numbersf/SCHED_PATCH.git -b $CPU || { echo "❌ CPU 分支不存在，风驰内核暂未支持你的机型，请关闭后重试"; exit 11; }
+          git clone --depth=1 --single-branch https://github.com/Numbersf/SCHED_PATCH.git -b $CPU || { echo "❌ CPU 分支不存在，风驰内核暂未支持你的机型，请关闭后重试"; exit 11; }
           echo "正在拉取风驰补丁"
           cp ./SCHED_PATCH/fengchi_${CLEAN_FILE}.patch ./
           if [[ -f "fengchi_${CLEAN_FILE}.patch" ]]; then
